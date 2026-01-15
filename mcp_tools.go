@@ -12,7 +12,38 @@ import (
 	"fmt"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"trpc.group/trpc-go/trpc-mcp-go/internal/schema"
 )
+
+// SchemaOption configures schema generation behavior for both input and output schemas.
+type SchemaOption func(*schema.ConverterOptions)
+
+// WithInlineStyle sets schema generation to inline expansion style.
+// This expands all types inline up to depth 6, resulting in larger schemas.
+// with circular references truncated at the depth limit.
+func WithInlineStyle() SchemaOption {
+	return func(opts *schema.ConverterOptions) {
+		opts.RefStyle = schema.RefStyleInline
+		opts.MaxInlineDepth = 6
+	}
+}
+
+// WithRefStyle sets schema generation to $defs + $ref style.
+// This generates compact schemas with $defs and $ref (Go style).
+// Example: "$ref": "#/$defs/TreeNode"
+func WithRefStyle() SchemaOption {
+	return func(opts *schema.ConverterOptions) {
+		opts.RefStyle = schema.RefStyleDefs
+	}
+}
+
+// WithNestedRefStyle sets schema generation to nested inline $ref style.
+// Example: "$ref": "#/properties/tree"
+func WithNestedRefStyle() SchemaOption {
+	return func(opts *schema.ConverterOptions) {
+		opts.RefStyle = schema.RefStyleNested
+	}
+}
 
 // ListToolsRequest represents a request to list available tools
 type ListToolsRequest struct {
@@ -56,8 +87,9 @@ type RequestMeta struct {
 // CallToolResult represents tool call result
 type CallToolResult struct {
 	Result
-	Content []Content `json:"content"`
-	IsError bool      `json:"isError,omitempty"`
+	Content           []Content   `json:"content"`
+	StructuredContent interface{} `json:"structuredContent,omitempty"`
+	IsError           bool        `json:"isError,omitempty"`
 }
 
 // ResultMeta represents result metadata
@@ -68,6 +100,31 @@ type ResultMeta struct {
 // ToolListChangedNotification describes a tool list changed notification.
 type ToolListChangedNotification struct {
 	Notification
+}
+
+// ToolAnnotations represents annotations for tools that provide hints to clients about tool behavior.
+// All properties are hints and should not be used for security decisions.
+type ToolAnnotations struct {
+	// Title provides a human-readable title for the tool.
+	Title string `json:"title,omitempty"`
+
+	// ReadOnlyHint indicates the tool does not modify its environment.
+	// Default: false
+	ReadOnlyHint *bool `json:"readOnlyHint,omitempty"`
+
+	// DestructiveHint indicates the tool may perform destructive updates.
+	// Only meaningful when ReadOnlyHint is false.
+	// Default: true
+	DestructiveHint *bool `json:"destructiveHint,omitempty"`
+
+	// IdempotentHint indicates repeated calls with same arguments have no additional effect.
+	// Only meaningful when ReadOnlyHint is false.
+	// Default: false
+	IdempotentHint *bool `json:"idempotentHint,omitempty"`
+
+	// OpenWorldHint indicates the tool interacts with external entities.
+	// Default: true
+	OpenWorldHint *bool `json:"openWorldHint,omitempty"`
 }
 
 // Tool represents an MCP tool.
@@ -81,8 +138,16 @@ type Tool struct {
 	// Input parameter schema
 	InputSchema *openapi3.Schema `json:"inputSchema"`
 
-	// Raw schema (for custom schemas)
+	// Output schema for structured responses
+	OutputSchema *openapi3.Schema `json:"outputSchema,omitempty"`
+
+	// Tool annotations providing hints about tool behavior
+	Annotations *ToolAnnotations `json:"annotations,omitempty"`
+
+	// Raw input schema
 	RawInputSchema json.RawMessage `json:"-"`
+	// Raw output schema
+	RawOutputSchema json.RawMessage `json:"-"`
 }
 
 // toolHandler defines the function type for handling tool execution
@@ -96,6 +161,9 @@ type registeredTool struct {
 
 // ToolOption represents a function that configures a Tool
 type ToolOption func(*Tool)
+
+// TypedToolHandler defines a handler function that receives typed input and returns typed output
+type TypedToolHandler[I any, O any] func(ctx context.Context, req *CallToolRequest, input I) (O, error)
 
 // PropertyOption represents a function that configures a schema property
 type PropertyOption func(*openapi3.Schema)
@@ -133,6 +201,63 @@ func WithDescription(description string) ToolOption {
 	}
 }
 
+// WithInputStruct generates input schema from a Go struct type.
+//
+// By default, uses ref style ($defs + $ref) for compact schemas.
+// You can customize the generation style by passing SchemaOption:
+//
+// Example:
+//
+//	mcp.WithInputStruct[T]()                      // default ref style
+//	mcp.WithInputStruct[T](mcp.WithInlineStyle()) // inline style
+func WithInputStruct[T any](opts ...SchemaOption) ToolOption {
+	return func(t *Tool) {
+		if len(opts) == 0 {
+			// No options: use default (fast path)
+			t.InputSchema = schema.ConvertStructToOpenAPISchema[T]()
+		} else {
+			// Apply custom options
+			converterOpts := schema.DefaultConverterOptions
+			for _, opt := range opts {
+				opt(&converterOpts)
+			}
+			t.InputSchema = schema.ConvertStructToOpenAPISchemaWithOptions[T](converterOpts)
+		}
+	}
+}
+
+// WithOutputStruct generates output schema from a Go struct type.
+//
+// By default, uses ref style ($defs + $ref) for compact schemas.
+// You can customize the generation style by passing SchemaOption:
+//
+// Example:
+//
+//	mcp.WithOutputStruct[T]()                      // default ref style
+//	mcp.WithOutputStruct[T](mcp.WithInlineStyle()) // inline style
+func WithOutputStruct[T any](opts ...SchemaOption) ToolOption {
+	return func(t *Tool) {
+		if len(opts) == 0 {
+			// No options: use default (fast path)
+			t.OutputSchema = schema.ConvertStructToOpenAPISchema[T]()
+		} else {
+			// Apply custom options
+			converterOpts := schema.DefaultConverterOptions
+			for _, opt := range opts {
+				opt(&converterOpts)
+			}
+			t.OutputSchema = schema.ConvertStructToOpenAPISchemaWithOptions[T](converterOpts)
+		}
+	}
+}
+
+// WithToolAnnotations sets tool annotations that provide hints about tool behavior
+func WithToolAnnotations(annotations *ToolAnnotations) ToolOption {
+	return func(t *Tool) {
+		t.Annotations = annotations
+	}
+}
+
 // WithString adds a string parameter to the tool's input schema
 func WithString(name string, opts ...PropertyOption) ToolOption {
 	return func(t *Tool) {
@@ -143,8 +268,9 @@ func WithString(name string, opts ...PropertyOption) ToolOption {
 			opt(schema)
 		}
 		t.InputSchema.Properties[name] = openapi3.NewSchemaRef("", schema)
-		if schema.Required != nil && len(schema.Required) > 0 {
+		if len(schema.Required) > 0 {
 			t.InputSchema.Required = append(t.InputSchema.Required, name)
+			schema.Required = nil // Clean up the temporary marker
 		}
 	}
 }
@@ -159,8 +285,9 @@ func WithNumber(name string, opts ...PropertyOption) ToolOption {
 			opt(schema)
 		}
 		t.InputSchema.Properties[name] = openapi3.NewSchemaRef("", schema)
-		if schema.Required != nil && len(schema.Required) > 0 {
+		if len(schema.Required) > 0 {
 			t.InputSchema.Required = append(t.InputSchema.Required, name)
+			schema.Required = nil // Clean up the temporary marker
 		}
 	}
 }
@@ -175,8 +302,9 @@ func WithInteger(name string, opts ...PropertyOption) ToolOption {
 			opt(schema)
 		}
 		t.InputSchema.Properties[name] = openapi3.NewSchemaRef("", schema)
-		if schema.Required != nil && len(schema.Required) > 0 {
+		if len(schema.Required) > 0 {
 			t.InputSchema.Required = append(t.InputSchema.Required, name)
+			schema.Required = nil // Clean up the temporary marker
 		}
 	}
 }
@@ -191,8 +319,9 @@ func WithBoolean(name string, opts ...PropertyOption) ToolOption {
 			opt(schema)
 		}
 		t.InputSchema.Properties[name] = openapi3.NewSchemaRef("", schema)
-		if schema.Required != nil && len(schema.Required) > 0 {
+		if len(schema.Required) > 0 {
 			t.InputSchema.Required = append(t.InputSchema.Required, name)
+			schema.Required = nil // Clean up the temporary marker
 		}
 	}
 }
@@ -208,8 +337,9 @@ func WithObject(name string, opts ...PropertyOption) ToolOption {
 			opt(schema)
 		}
 		t.InputSchema.Properties[name] = openapi3.NewSchemaRef("", schema)
-		if schema.Required != nil && len(schema.Required) > 0 {
+		if len(schema.Required) > 0 {
 			t.InputSchema.Required = append(t.InputSchema.Required, name)
+			schema.Required = nil // Clean up the temporary marker
 		}
 	}
 }
@@ -270,8 +400,9 @@ func WithArray(name string, opts ...PropertyOption) ToolOption {
 			opt(schema)
 		}
 		t.InputSchema.Properties[name] = openapi3.NewSchemaRef("", schema)
-		if schema.Required != nil && len(schema.Required) > 0 {
+		if len(schema.Required) > 0 {
 			t.InputSchema.Required = append(t.InputSchema.Required, name)
+			schema.Required = nil // Clean up the temporary marker
 		}
 	}
 }
@@ -348,25 +479,33 @@ func parseCallToolResult(rawMessage *json.RawMessage) (*CallToolResult, error) {
 		return nil, fmt.Errorf("content is missing")
 	}
 
-	contentArr, ok := contents.([]any)
-	if !ok {
-		return nil, fmt.Errorf("content is not an array")
+	if contents != nil {
+		contentArr, ok := contents.([]any)
+		if !ok {
+			return nil, fmt.Errorf("content is not an array")
+		}
+
+		for _, content := range contentArr {
+			// Extract content.
+			contentMap, ok := content.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("content is not an object")
+			}
+
+			// Process content.
+			content, err := parseContent(contentMap)
+			if err != nil {
+				return nil, err
+			}
+
+			result.Content = append(result.Content, content)
+		}
 	}
 
-	for _, content := range contentArr {
-		// Extract content.
-		contentMap, ok := content.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("content is not an object")
-		}
-
-		// Process content.
-		content, err := parseContent(contentMap)
-		if err != nil {
-			return nil, err
-		}
-
-		result.Content = append(result.Content, content)
+	// Parse structuredContent if present
+	structuredContent, ok := jsonContent["structuredContent"]
+	if ok {
+		result.StructuredContent = structuredContent
 	}
 
 	return &result, nil
@@ -464,4 +603,10 @@ func parseResourceContents(contentMap map[string]any) (ResourceContents, error) 
 	}
 
 	return nil, fmt.Errorf("unsupported resource type")
+}
+
+// BoolPtr returns a pointer to the given boolean value.
+// This is a utility function for setting ToolAnnotations hint fields.
+func BoolPtr(b bool) *bool {
+	return &b
 }

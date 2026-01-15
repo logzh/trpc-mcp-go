@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	icontext "trpc.group/trpc-go/trpc-mcp-go/internal/context"
 	"trpc.group/trpc-go/trpc-mcp-go/internal/retry"
 )
 
@@ -36,10 +37,11 @@ type sseClientTransport struct {
 	responsesMu    sync.RWMutex                     // Mutex for responses map.
 
 	sseConn struct {
-		active bool               // Flag indicating if connection is active.
-		ctx    context.Context    // Context for the SSE connection.
-		cancel context.CancelFunc // Function to cancel the SSE connection.
-		mutex  sync.Mutex         // Mutex for synchronizing connection operations.
+		active    bool               // Flag indicating if connection is active.
+		ctx       context.Context    // Context for the SSE connection.
+		cancel    context.CancelFunc // Function to cancel the SSE connection.
+		bodyClose func() error       // Function to close the response body.
+		mutex     sync.Mutex         // Mutex for synchronizing connection operations.
 	}
 
 	onNotification func(notification *JSONRPCNotification) // Notification handler.
@@ -69,6 +71,11 @@ func NewSSEClient(serverURL string, clientInfo Implementation, options ...Client
 	// extract transport configuration.
 	config := extractTransportConfig(options)
 	config.serverURL = parsedURL
+
+	// Apply custom path to server URL if specified.
+	if config.path != "" {
+		parsedURL.Path = config.path
+	}
 
 	// Create client options with standard options.
 	clientOptions := []ClientOption{
@@ -110,10 +117,7 @@ func NewSSEClient(serverURL string, clientInfo Implementation, options ...Client
 		return nil, err
 	}
 
-	err = c.transport.start(context.Background())
-	if err != nil {
-		return nil, err
-	}
+	// Transport will auto-start on first request (e.g., Initialize) with the correct context.
 
 	return c, nil
 }
@@ -136,7 +140,7 @@ func (t *sseClientTransport) start(ctx context.Context) error {
 	}
 
 	// Create a new context with cancellation for the SSE stream.
-	sseCtx, cancel := context.WithCancel(context.Background())
+	sseCtx, cancel := context.WithCancel(icontext.WithoutCancel(ctx))
 	t.sseConn.mutex.Lock()
 	t.sseConn.ctx = sseCtx
 	t.sseConn.cancel = cancel
@@ -158,6 +162,13 @@ func (t *sseClientTransport) start(ctx context.Context) error {
 	for key, values := range t.httpHeaders {
 		for _, value := range values {
 			req.Header.Add(key, value)
+		}
+	}
+
+	// Apply HTTP before-request functions.
+	if t.client != nil {
+		if err := t.client.applyHTTPBeforeRequest(sseCtx, req); err != nil {
+			return fmt.Errorf("HTTP before-request failed: %w", err)
 		}
 	}
 
@@ -183,6 +194,7 @@ func (t *sseClientTransport) start(ctx context.Context) error {
 
 	t.sseConn.mutex.Lock()
 	t.sseConn.active = true
+	t.sseConn.bodyClose = resp.Body.Close // Save the body close function.
 	t.sseConn.mutex.Unlock()
 
 	// Start reading SSE events.
@@ -528,7 +540,9 @@ func (t *sseClientTransport) sendRequest(ctx context.Context, req *JSONRPCReques
 func (t *sseClientTransport) sendRequestInternal(ctx context.Context, req *JSONRPCRequest) (*json.RawMessage, error) {
 	// Auto-start the transport if not already started.
 	if !t.started.Load() {
-		return nil, errors.New("transport not started")
+		if err := t.start(ctx); err != nil {
+			return nil, fmt.Errorf("failed to start transport: %w", err)
+		}
 	}
 
 	if t.closed.Load() {
@@ -574,6 +588,13 @@ func (t *sseClientTransport) sendRequestInternal(ctx context.Context, req *JSONR
 	for key, values := range t.httpHeaders {
 		for _, value := range values {
 			httpReq.Header.Add(key, value)
+		}
+	}
+
+	// Apply HTTP before-request functions.
+	if t.client != nil {
+		if err := t.client.applyHTTPBeforeRequest(ctx, httpReq); err != nil {
+			return nil, fmt.Errorf("HTTP before-request failed: %w", err)
 		}
 	}
 
@@ -666,6 +687,13 @@ func (t *sseClientTransport) sendNotification(ctx context.Context, notification 
 		}
 	}
 
+	// Apply HTTP before-request functions.
+	if t.client != nil {
+		if err := t.client.applyHTTPBeforeRequest(ctx, httpReq); err != nil {
+			return fmt.Errorf("HTTP before-request failed: %w", err)
+		}
+	}
+
 	// Send the request.
 	resp, err := t.httpReqHandler.Handle(ctx, t.httpClient, httpReq)
 	if err != nil {
@@ -694,12 +722,19 @@ func (t *sseClientTransport) close() error {
 		return nil // Already closed.
 	}
 
-	// Cancel the SSE connection if active.
+	// Close the SSE connection if active.
 	t.sseConn.mutex.Lock()
+	// Close the response body first to immediately terminate the connection.
+	if t.sseConn.bodyClose != nil {
+		t.sseConn.bodyClose()
+		t.sseConn.bodyClose = nil
+	}
+	// Then cancel the context.
 	if t.sseConn.cancel != nil {
 		t.sseConn.cancel()
-		t.sseConn.active = false
+		t.sseConn.cancel = nil
 	}
+	t.sseConn.active = false
 	t.sseConn.mutex.Unlock()
 
 	// Close all response channels.

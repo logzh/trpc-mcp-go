@@ -77,6 +77,12 @@ type serverConfig struct {
 	// Tool list filter function
 	toolListFilter ToolListFilter
 
+	// Prompt list filter function
+	promptListFilter PromptListFilter
+
+	// Resource list filter function
+	resourceListFilter ResourceListFilter
+
 	// Method name modifier for external customization.
 	methodNameModifier MethodNameModifier
 }
@@ -100,6 +106,7 @@ type Server struct {
 	requestID            atomic.Int64                         // Request ID counter for generating unique request IDs.
 	notificationHandlers map[string]ServerNotificationHandler // Map of notification handlers by method name.
 	notificationMu       sync.RWMutex                         // Mutex for notification handlers map.
+	pendingMiddlewares   []Middleware                         // Middlewares to be applied after component initialization.
 }
 
 // NewServer creates a new MCP server
@@ -163,10 +170,18 @@ func (s *Server) initComponents() {
 
 	// Create resource manager.
 	resourceManager := newResourceManager()
+	// Only set resource list filter if not nil.
+	if s.config.resourceListFilter != nil {
+		resourceManager.withResourceListFilter(s.config.resourceListFilter)
+	}
 	s.resourceManager = resourceManager
 
 	// Create prompt manager.
 	promptManager := newPromptManager()
+	// Only set prompt list filter if not nil.
+	if s.config.promptListFilter != nil {
+		promptManager.withPromptListFilter(s.config.promptListFilter)
+	}
 	s.promptManager = promptManager
 
 	// Create MCP handler.
@@ -177,6 +192,11 @@ func (s *Server) initComponents() {
 		withPromptManager(promptManager),
 		withServer(s), // Set the server reference for notification handling.
 	)
+
+	// Apply pending middlewares that were registered via WithMiddleware option.
+	for _, mw := range s.pendingMiddlewares {
+		s.mcpHandler.use(mw)
+	}
 
 	// Collect HTTP handler options.
 	var httpOptions []func(*httpServerHandler)
@@ -306,6 +326,81 @@ func WithToolListFilter(filter ToolListFilter) ServerOption {
 	}
 }
 
+// WithPromptListFilter sets a prompt list filter that will be applied to prompts/list requests.
+// The filter function receives the request context and all registered prompts, and should
+// return a filtered list of prompts that should be visible to the client.
+//
+// The context may contain user information extracted from HTTP headers (in stateless mode)
+// or session information (in stateful mode).
+//
+// Example:
+//
+//	server := mcp.NewServer("my-server", "1.0",
+//	    mcp.WithHTTPContextFunc(extractUserInfo), // Extract user info from headers
+//	    mcp.WithPromptListFilter(func(ctx context.Context, prompts []*mcp.Prompt) []*mcp.Prompt {
+//	        userRole := mcp.GetUserRole(ctx)
+//	        if userRole == "admin" {
+//	            return prompts // Admin sees all prompts
+//	        }
+//	        return filterUserPrompts(prompts) // Filter for regular users
+//	    }),
+//	)
+func WithPromptListFilter(filter PromptListFilter) ServerOption {
+	return func(s *Server) {
+		s.config.promptListFilter = filter
+	}
+}
+
+// WithResourceListFilter sets a resource list filter that will be applied to resources/list requests.
+// The filter function receives the request context and all registered resources, and should
+// return a filtered list of resources that should be visible to the client.
+//
+// The context may contain user information extracted from HTTP headers (in stateless mode)
+// or session information (in stateful mode).
+//
+// Example:
+//
+//	server := mcp.NewServer("my-server", "1.0",
+//	    mcp.WithHTTPContextFunc(extractUserInfo), // Extract user info from headers
+//	    mcp.WithResourceListFilter(func(ctx context.Context, resources []*mcp.Resource) []*mcp.Resource {
+//	        userRole := mcp.GetUserRole(ctx)
+//	        if userRole == "admin" {
+//	            return resources // Admin sees all resources
+//	        }
+//	        return filterUserResources(resources) // Filter for regular users
+//	    }),
+//	)
+func WithResourceListFilter(filter ResourceListFilter) ServerOption {
+	return func(s *Server) {
+		s.config.resourceListFilter = filter
+	}
+}
+
+// WithMiddleware registers one or more middlewares to the server.
+// Middlewares are executed in the order they are provided.
+// All middlewares must be configured at server creation time.
+//
+// Example:
+//
+//	server := mcp.NewServer("name", "1.0.0",
+//	    mcp.WithServerAddress(":3000"),
+//	    mcp.WithMiddleware(TraceMiddleware, LoggingMiddleware, MetricsMiddleware),
+//	)
+//
+// Multiple WithMiddleware calls can be used:
+//
+//	server := mcp.NewServer("name", "1.0.0",
+//	    mcp.WithMiddleware(TraceMiddleware, LoggingMiddleware),
+//	    mcp.WithMiddleware(MetricsMiddleware),
+//	)
+func WithMiddleware(middlewares ...Middleware) ServerOption {
+	return func(s *Server) {
+		// Save middlewares to be applied after component initialization
+		// to avoid initialization order issues.
+		s.pendingMiddlewares = append(s.pendingMiddlewares, middlewares...)
+	}
+}
+
 // WithServerAddress sets the server address
 func WithServerAddress(addr string) ServerOption {
 	return func(s *Server) {
@@ -325,6 +420,34 @@ func (s *Server) Start() error {
 // RegisterTool registers a tool with its handler function
 func (s *Server) RegisterTool(tool *Tool, handler toolHandler) {
 	s.toolManager.registerTool(tool, handler)
+}
+
+// GetTool retrieves a registered tool by name.
+// Returns the tool and true if found, otherwise returns zero value and false.
+// The returned tool is a copy to prevent accidental modification.
+func (s *Server) GetTool(name string) (Tool, bool) {
+	if name == "" {
+		return Tool{}, false
+	}
+
+	tool, exists := s.toolManager.getTool(name)
+	if !exists {
+		return Tool{}, false
+	}
+	// Return a copy to prevent modification of the original
+	return *tool, true
+}
+
+// GetTools returns a copy of all registered tools.
+// The returned slice contains copies of the tools to prevent accidental modification.
+func (s *Server) GetTools() []Tool {
+	toolPtrs := s.toolManager.getTools()
+
+	tools := make([]Tool, 0, len(toolPtrs))
+	for _, toolPtr := range toolPtrs {
+		tools = append(tools, *toolPtr) // getTools() guarantees non-nil
+	}
+	return tools
 }
 
 // UnregisterTools removes multiple tools by names and returns an error if no tools were unregistered

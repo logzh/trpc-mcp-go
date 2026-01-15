@@ -1,5 +1,66 @@
 # Changelog
 
+## 0.0.11 (2025-12-09)
+
+### Fixes
+- fix: add nil check for tool result content (#97)
+- fix(sse): prevent panic when flushing closed SSE connections (#98)
+
+## 0.0.10 (2025-11-10)
+
+### Features
+- feat: add HTTPBeforeRequest support (#92)
+
+## 0.0.9 (2025-11-07)
+
+### Features
+- feat: add middleware support for request/response interception (#89)
+
+### Fixes
+- fix: close SSE response body before canceling context (#93)
+
+## 0.0.8 (2025-10-29)
+
+### Features
+- feat: add nested $ref schema generation mode with Inspector compatibility (#90)
+
+### Fixes
+- fix: preserve context metadata in SSE transport (#88)
+
+## 0.0.7 (2025-10-15)
+
+### Features
+- feat: refactor context handling to use WithoutCancel (#86)
+
+### Fixes
+- schema: fix circular reference recursion (#87)
+
+## 0.0.6 (2025-09-29)
+
+### Features
+- feat: enhance jsonschema tag support and add SSE server path method (#84)
+- feat: align prompt/resource list filtering with tools (#77)
+- feat(sse): add custom session ID generator support (#83)
+
+### Fixes
+- fix: Resource arguments not passed to handler (#82)
+- fix: fix double-wrapped JSON-RPC error in HTTP transports (#79)
+
+## 0.0.5 (2025-09-05)
+
+### Features
+- feat: downgrade Go version from 1.22.5 to 1.20 for broader compatibility (#70)
+- feat: add get tools methods for server-side (#67)
+- feat: implement MCP ToolAnnotations support (#66)
+- refactor: reorganize examples with transport-based structure (#65)
+- feat: add output schema and structured content support (#62)
+
+### Fixes
+- fix: ensure client options properly configure SSE transport (#71)
+- fix: static check warning (#49)
+- fix: example (#50)
+- fix: default value for WithClientGetSSEEnabled (#51)
+
 ## 0.0.4 (2025-08-29)
 
 - sse: remove SSE response size limit (#63)

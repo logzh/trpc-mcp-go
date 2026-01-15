@@ -15,6 +15,11 @@ import (
 // promptHandler defines the function type for handling prompt requests
 type promptHandler func(ctx context.Context, req *GetPromptRequest) (*GetPromptResult, error)
 
+// PromptListFilter defines a function type for filtering prompts based on context.
+// The filter receives the request context and all registered prompts, and returns
+// a filtered list of prompts that should be visible to the client.
+type PromptListFilter func(ctx context.Context, prompts []*Prompt) []*Prompt
+
 // registeredPrompt combines a Prompt with its handler function
 type registeredPrompt struct {
 	Prompt  *Prompt
@@ -103,7 +108,7 @@ func (pm *PromptMessage) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("failed to unmarshal prompt message structure: %w", err)
 	}
 
-	if temp.Content != nil && len(temp.Content) > 0 {
+	if len(temp.Content) > 0 {
 		// Check for JSON null value first
 		if string(temp.Content) == "null" {
 			pm.Content = nil

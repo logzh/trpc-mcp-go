@@ -10,14 +10,36 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
+
+	icontext "trpc.group/trpc-go/trpc-mcp-go/internal/context"
 )
+
+// SessionIDGenerator defines an interface for generating custom session IDs.
+type SessionIDGenerator interface {
+	// GenerateSessionID generates a session ID based on the HTTP request.
+	// This allows implementations to include client IP, port, headers, etc.
+	GenerateSessionID(r *http.Request) string
+}
+
+// defaultSessionIDGenerator is the default implementation that generates
+// UUID-based session IDs following the same pattern as trpc-agent-go.
+type defaultSessionIDGenerator struct{}
+
+// GenerateSessionID generates a UUID-based session ID.
+func (g *defaultSessionIDGenerator) GenerateSessionID(r *http.Request) string {
+	return fmt.Sprintf("sse-%s", uuid.New().String())
+}
 
 // sseSession represents an active SSE connection.
 type sseSession struct {
@@ -31,6 +53,28 @@ type sseSession struct {
 	lastActivity        time.Time                 // Last activity time.
 	data                map[string]interface{}    // Session data.
 	dataMu              sync.RWMutex              // Data mutex.
+}
+
+// sseStream wraps the components required to write SSE responses safely.
+type sseStream struct {
+	logger  Logger
+	writer  http.ResponseWriter
+	flusher http.Flusher
+	mu      *sync.Mutex
+}
+
+// serializedRequest contains all necessary information to process an HTTP
+// request on a remote node when using a distributed SessionPubSub.
+// It intentionally mirrors the structure used in the internal mcp-go project
+// to maximize cross-project compatibility for multi-node deployments.
+type serializedRequest struct {
+	Method     string              `json:"method"`
+	URL        string              `json:"url"`
+	Headers    map[string][]string `json:"headers"`
+	Body       []byte              `json:"body"`
+	RemoteAddr string              `json:"remote_addr,omitempty"`
+	Query      url.Values          `json:"query"`
+	Deadline   *time.Time          `json:"deadline,omitempty"`
 }
 
 // SessionID returns the session ID.
@@ -122,6 +166,8 @@ type SSEServer struct {
 	sessions             sync.Map                                                   // Active sessions.
 	httpServer           *http.Server                                               // HTTP server.
 	contextFunc          func(ctx context.Context, r *http.Request) context.Context // HTTP context function.
+	sessionIDGenerator   SessionIDGenerator                                         // Custom session ID generator.
+	sessionPubSub        SessionPubSub                                              // Optional session Pub/Sub for distributed sessions.
 	keepAlive            bool                                                       // Whether to keep the connection alive.
 	keepAliveInterval    time.Duration                                              // Keep-alive interval.
 	logger               Logger                                                     // Logger for this server.
@@ -134,6 +180,20 @@ type SSEServer struct {
 
 // SSEOption defines a function type for configuring the SSE server.
 type SSEOption func(*SSEServer)
+
+// SessionMessageHandler handles messages delivered via a SessionPubSub
+// implementation for a specific session ID.
+type SessionMessageHandler func(ctx context.Context, sessionID string, payload []byte) error
+
+// SessionPubSub defines an interface for distributed session messaging.
+// Implementations can be backed by Redis, message queues, or any other
+// Pub/Sub mechanism. The payload is transport-agnostic and typically a
+// JSON-encoded serializedRequest.
+type SessionPubSub interface {
+	Publish(ctx context.Context, sessionID string, payload []byte) error
+	Subscribe(ctx context.Context, sessionID string, handler SessionMessageHandler) error
+	Unsubscribe(ctx context.Context, sessionID string) error
+}
 
 // NewSSEServer creates a new SSE server for MCP communication.
 func NewSSEServer(name, version string, opts ...SSEOption) *SSEServer {
@@ -170,6 +230,7 @@ func NewSSEServer(name, version string, opts ...SSEOption) *SSEServer {
 		serverInfo:           serverInfo,
 		sseEndpoint:          "/sse",
 		messageEndpoint:      "/message",
+		sessionIDGenerator:   &defaultSessionIDGenerator{}, // Default session ID generator
 		keepAlive:            true,
 		keepAliveInterval:    30 * time.Second,
 		logger:               GetDefaultLogger(),
@@ -195,6 +256,14 @@ func WithBasePath(basePath string) SSEOption {
 			basePath = "/" + basePath
 		}
 		s.basePath = strings.TrimSuffix(basePath, "/")
+	}
+}
+
+// WithSessionPubSub sets a SessionPubSub implementation to enable distributed
+// session routing across multiple server nodes.
+func WithSessionPubSub(pubSub SessionPubSub) SSEOption {
+	return func(s *SSEServer) {
+		s.sessionPubSub = pubSub
 	}
 }
 
@@ -248,6 +317,54 @@ func WithSSEServerLogger(logger Logger) SSEOption {
 	}
 }
 
+// WithSSEToolListFilter sets a tool list filter for the SSE server.
+func WithSSEToolListFilter(filter ToolListFilter) SSEOption {
+	return func(s *SSEServer) {
+		s.toolManager.withToolListFilter(filter)
+	}
+}
+
+// WithSSEPromptListFilter sets a prompt list filter for the SSE server.
+func WithSSEPromptListFilter(filter PromptListFilter) SSEOption {
+	return func(s *SSEServer) {
+		s.promptManager.withPromptListFilter(filter)
+	}
+}
+
+// WithSSEResourceListFilter sets a resource list filter for the SSE server.
+func WithSSEResourceListFilter(filter ResourceListFilter) SSEOption {
+	return func(s *SSEServer) {
+		s.resourceManager.withResourceListFilter(filter)
+	}
+}
+
+// WithSSESessionIDGenerator sets a custom session ID generator for the SSE server.
+// This allows users to customize session ID generation, for example, to include
+// client IP and port information for load balancing node affinity.
+func WithSSESessionIDGenerator(generator SessionIDGenerator) SSEOption {
+	return func(s *SSEServer) {
+		s.sessionIDGenerator = generator
+	}
+}
+
+// WithSSEMiddleware registers one or more middlewares to the SSE server.
+// Middlewares are executed in the order they are provided.
+// All middlewares must be configured at server creation time.
+//
+// Example:
+//
+//	server := mcp.NewSSEServer("name", "1.0.0",
+//	    mcp.WithSSEEndpoint("/sse"),
+//	    mcp.WithSSEMiddleware(LoggingMiddleware, MetricsMiddleware),
+//	)
+func WithSSEMiddleware(middlewares ...Middleware) SSEOption {
+	return func(s *SSEServer) {
+		for _, mw := range middlewares {
+			s.mcpHandler.use(mw)
+		}
+	}
+}
+
 // Start starts the SSE server on the given address.
 func (s *SSEServer) Start(addr string) error {
 	return http.ListenAndServe(addr, s)
@@ -260,7 +377,7 @@ func (s *SSEServer) Shutdown(ctx context.Context) error {
 		// Close all sessions.
 		s.sessions.Range(func(key, value interface{}) bool {
 			if session, ok := value.(*sseSession); ok {
-				close(session.done)
+				closeSessionDone(s.logger, session)
 			}
 			s.sessions.Delete(key)
 			return true
@@ -298,6 +415,32 @@ func (s *SSEServer) getMessageEndpointForClient(sessionID string) string {
 	return fullPath
 }
 
+// trySubscribe registers the current server instance as a subscriber for the
+// given session ID if a SessionPubSub implementation is configured.
+func (s *SSEServer) trySubscribe(ctx context.Context, sessionID string) {
+	if s.sessionPubSub == nil {
+		return
+	}
+	if err := s.sessionPubSub.Subscribe(ctx, sessionID, s.handleSessionMessage); err != nil {
+		if s.logger != nil {
+			s.logger.Errorf("Failed to subscribe to session %s: %v", sessionID, err)
+		}
+	}
+}
+
+// tryUnsubscribe removes the subscription for the given session ID if a
+// SessionPubSub implementation is configured.
+func (s *SSEServer) tryUnsubscribe(ctx context.Context, sessionID string) {
+	if s.sessionPubSub == nil {
+		return
+	}
+	if err := s.sessionPubSub.Unsubscribe(ctx, sessionID); err != nil {
+		if s.logger != nil {
+			s.logger.Errorf("Failed to unsubscribe from session %s: %v", sessionID, err)
+		}
+	}
+}
+
 // handleSSE handles SSE connection requests.
 func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
@@ -321,7 +464,7 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	// Create session.
-	sessionID := generateSessionID()
+	sessionID := s.sessionIDGenerator.GenerateSessionID(r)
 	session := &sseSession{
 		done:                make(chan struct{}),
 		eventQueue:          make(chan string, 100),
@@ -345,24 +488,44 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	// Set session information to context.
 	ctx = setSessionToContext(ctx, session)
 
+	// Subscribe to distributed SessionPubSub if configured.
+	if s.sessionPubSub != nil {
+		s.trySubscribe(ctx, sessionID)
+		defer func() {
+			// Use a detached context with timeout to ensure unsubscribe has a chance
+			// to complete even if the request context is already canceled.
+			detached := icontext.WithoutCancel(context.Background())
+			unsubCtx, cancel := context.WithTimeout(detached, 5*time.Second)
+			defer cancel()
+			s.tryUnsubscribe(unsubCtx, sessionID)
+		}()
+	}
+
+	stream := &sseStream{
+		logger:  s.logger,
+		writer:  w,
+		flusher: flusher,
+		mu:      &session.writeMu,
+	}
+
 	// Send endpoint event.
 	endpointURL := s.getMessageEndpointForClient(sessionID)
-	if !sendSSEEvent(w, flusher, &session.writeMu, "endpoint", endpointURL) {
+	if !stream.SendEvent("endpoint", endpointURL) {
 		return
 	}
 
 	// Send initial connection message.
-	sendSSEComment(w, flusher, &session.writeMu, "connection established")
+	stream.SendComment("connection established")
 
 	// Start notification handler.
-	go handleNotifications(s.logger, w, flusher, session)
+	go handleNotifications(ctx, s.logger, w, flusher, session)
 
 	// Start event queue handler.
-	go handleEventQueue(s.logger, w, flusher, session)
+	go handleEventQueue(ctx, s.logger, w, flusher, session)
 
 	// Start keep-alive handler.
 	if s.keepAlive {
-		go handleKeepAlive(s.logger, w, flusher, session, s.keepAliveInterval)
+		go handleKeepAlive(ctx, s.logger, w, flusher, session, s.keepAliveInterval)
 	}
 
 	// Wait for connection to close.
@@ -376,35 +539,68 @@ func (s *SSEServer) handleSSE(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clean up resources.
-	close(session.done)
+	closeSessionDone(s.logger, session)
 	s.sessions.Delete(sessionID)
 	s.logger.Debugf("Cleaned up session %s", sessionID)
 }
 
-// sendSSEEvent sends SSE event and returns whether it is successful.
-func sendSSEEvent(w http.ResponseWriter, flusher http.Flusher, mu *sync.Mutex, eventType, data string) bool {
-	mu.Lock()
-	defer mu.Unlock()
+// closeSessionDone safely closes the session done channel with panic protection.
+func closeSessionDone(logger Logger, session *sseSession) {
+	defer func() {
+		if r := recover(); r != nil && logger != nil {
+			logger.Errorf("Recovered from panic while closing session %s: %v", session.sessionID, r)
+		}
+	}()
+	if session != nil && session.done != nil {
+		close(session.done)
+	}
+}
+
+// safeFlush flushes the HTTP response writer with panic protection.
+func safeFlush(logger Logger, flusher http.Flusher) {
+	defer func() {
+		if r := recover(); r != nil && logger != nil {
+			logger.Errorf("Recovered from panic while flushing SSE response: %v", r)
+		}
+	}()
+	if flusher != nil {
+		flusher.Flush()
+	}
+}
+
+// SendEvent sends an SSE event and returns whether it is successful.
+func (s *sseStream) SendEvent(eventType, data string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	event := fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, data)
-	if _, err := fmt.Fprint(w, event); err != nil {
+	if _, err := fmt.Fprint(s.writer, event); err != nil {
+		if s.logger != nil {
+			s.logger.Errorf("Error writing SSE event %s: %v", eventType, err)
+		}
 		return false
 	}
-	flusher.Flush()
+	safeFlush(s.logger, s.flusher)
 	return true
 }
 
-// sendSSEComment sends SSE comment.
-func sendSSEComment(w http.ResponseWriter, flusher http.Flusher, mu *sync.Mutex, comment string) {
-	mu.Lock()
-	defer mu.Unlock()
+// SendComment sends an SSE comment frame.
+func (s *sseStream) SendComment(comment string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	fmt.Fprintf(w, ": %s\n\n", comment)
-	flusher.Flush()
+	fmt.Fprintf(s.writer, ": %s\n\n", comment)
+	safeFlush(s.logger, s.flusher)
 }
 
 // handleNotifications handles notification messages.
-func handleNotifications(logger Logger, w http.ResponseWriter, flusher http.Flusher, session *sseSession) {
+func handleNotifications(ctx context.Context, logger Logger, w http.ResponseWriter, flusher http.Flusher, session *sseSession) {
+	defer func() {
+		if r := recover(); r != nil && logger != nil {
+			logger.Errorf("Recovered from panic in SSE notification handler for session %s: %v", session.sessionID, r)
+		}
+	}()
+
 	for {
 		select {
 		case notification := <-session.notificationChannel:
@@ -416,47 +612,74 @@ func handleNotifications(logger Logger, w http.ResponseWriter, flusher http.Flus
 
 			session.writeMu.Lock()
 			fmt.Fprintf(w, "event: message\ndata: %s\n\n", data)
-			flusher.Flush()
+			safeFlush(logger, flusher)
 			session.writeMu.Unlock()
 
 		case <-session.done:
+			return
+		case <-ctx.Done():
+			if logger != nil {
+				logger.Debugf("Notification handler context done for session %s", session.sessionID)
+			}
 			return
 		}
 	}
 }
 
 // handleEventQueue handles event queue.
-func handleEventQueue(logger Logger, w http.ResponseWriter, flusher http.Flusher, session *sseSession) {
+func handleEventQueue(ctx context.Context, logger Logger, w http.ResponseWriter, flusher http.Flusher, session *sseSession) {
+	defer func() {
+		if r := recover(); r != nil && logger != nil {
+			logger.Errorf("Recovered from panic in SSE event queue handler for session %s: %v", session.sessionID, r)
+		}
+	}()
+
 	for {
 		select {
 		case event := <-session.eventQueue:
 			session.writeMu.Lock()
 			fmt.Fprint(w, event)
-			flusher.Flush()
+			safeFlush(logger, flusher)
 			session.writeMu.Unlock()
 
 		case <-session.done:
 			logger.Debugf("Event queue handler terminated for session %s", session.sessionID)
+			return
+		case <-ctx.Done():
+			if logger != nil {
+				logger.Debugf("Event queue handler context done for session %s", session.sessionID)
+			}
 			return
 		}
 	}
 }
 
 // handleKeepAlive handles keep-alive messages.
-func handleKeepAlive(logger Logger, w http.ResponseWriter, flusher http.Flusher, session *sseSession, interval time.Duration) {
+func handleKeepAlive(ctx context.Context, logger Logger, w http.ResponseWriter, flusher http.Flusher, session *sseSession, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	defer func() {
+		if r := recover(); r != nil && logger != nil {
+			logger.Errorf("Recovered from panic in SSE keepalive handler for session %s: %v", session.sessionID, r)
+		}
+	}()
 
 	for {
 		select {
 		case <-ticker.C:
 			session.writeMu.Lock()
 			fmt.Fprint(w, ": keepalive\n\n")
-			flusher.Flush()
+			safeFlush(logger, flusher)
 			session.writeMu.Unlock()
 
 		case <-session.done:
 			logger.Debugf("Keepalive handler terminated for session %s", session.sessionID)
+			return
+		case <-ctx.Done():
+			if logger != nil {
+				logger.Debugf("Keepalive handler context done for session %s", session.sessionID)
+			}
 			return
 		}
 	}
@@ -471,9 +694,28 @@ func (s *SSEServer) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get session from request
+	// Get session from request.
 	session, err := s.getSessionFromRequest(r)
 	if err != nil {
+		// If the session is not found but a SessionPubSub is configured, try to
+		// publish the request to the node that owns the session.
+		if s.sessionPubSub != nil && errors.Is(err, ErrSessionNotFound) {
+			sessionID := r.URL.Query().Get("sessionId")
+			if sessionID == "" {
+				s.handleSessionError(w, err)
+				return
+			}
+			if err := s.tryPublish(r.Context(), sessionID, r); err != nil {
+				if s.logger != nil {
+					s.logger.Errorf("Failed to publish message for remote session %s: %v", sessionID, err)
+				}
+				s.handleSessionError(w, err)
+				return
+			}
+			// Successfully handed off to another node.
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		s.handleSessionError(w, err)
 		return
 	}
@@ -547,7 +789,7 @@ func (s *SSEServer) handleNotificationMessage(ctx context.Context, rawMessage js
 	// Handle notification asynchronously.
 	go func() {
 		// Create a context that will not be canceled due to HTTP connection closure.
-		detachedCtx := context.WithoutCancel(ctx)
+		detachedCtx := icontext.WithoutCancel(ctx)
 
 		// Process notification (currently just log it, but can be extended).
 		if err := s.handleNotification(detachedCtx, &notification, session); err != nil {
@@ -657,7 +899,7 @@ func (s *SSEServer) getSessionFromRequest(r *http.Request) (*sseSession, error) 
 	// Get session.
 	sessionValue, ok := s.sessions.Load(sessionID)
 	if !ok {
-		return nil, fmt.Errorf("session not found: %s", sessionID)
+		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 
 	// Type assertion.
@@ -677,13 +919,55 @@ func (s *SSEServer) handleSessionError(w http.ResponseWriter, err error) {
 	errMsg := err.Error()
 	s.logger.Errorf("%s", errMsg)
 
-	if strings.Contains(errMsg, "missing sessionId") {
+	switch {
+	case strings.Contains(errMsg, "missing sessionId"):
 		http.Error(w, "Missing sessionId parameter", http.StatusBadRequest)
-	} else if strings.Contains(errMsg, "session not found") {
+	case errors.Is(err, ErrSessionNotFound):
 		http.Error(w, "Session not found", http.StatusNotFound)
-	} else {
+	default:
 		http.Error(w, "Invalid session", http.StatusInternalServerError)
 	}
+}
+
+// tryPublish serializes and publishes an HTTP request to a remote node via the
+// configured SessionPubSub implementation. It is used when the local server
+// does not have the requested session but other nodes may.
+func (s *SSEServer) tryPublish(ctx context.Context, sessionID string, r *http.Request) error {
+	if s.sessionPubSub == nil {
+		return fmt.Errorf("session pubsub not configured")
+	}
+
+	// Read the request body.
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read request body: %w", err)
+	}
+	defer r.Body.Close()
+
+	// Build serialized request compatible with mcp-go.
+	serialized := serializedRequest{
+		Method:     r.Method,
+		URL:        r.URL.String(),
+		Headers:    r.Header,
+		Body:       body,
+		RemoteAddr: r.RemoteAddr,
+		Query:      r.URL.Query(),
+	}
+
+	// Preserve deadline if present on context.
+	if deadline, ok := ctx.Deadline(); ok {
+		serialized.Deadline = &deadline
+	}
+
+	payload, err := json.Marshal(&serialized)
+	if err != nil {
+		return fmt.Errorf("failed to serialize request: %w", err)
+	}
+
+	if err := s.sessionPubSub.Publish(ctx, sessionID, payload); err != nil {
+		return fmt.Errorf("failed to publish message for session %s: %w", sessionID, err)
+	}
+	return nil
 }
 
 // parseJSONRPCRequest reads and parses the JSON-RPC request from the request body.
@@ -720,10 +1004,112 @@ func (s *SSEServer) createSessionContext(ctx context.Context, session *sseSessio
 	return ctx
 }
 
+// handleSessionMessage is the SessionPubSub callback used to process messages
+// for a specific session ID on the node that owns the SSE connection.
+func (s *SSEServer) handleSessionMessage(ctx context.Context, sessionID string, payload []byte) error {
+	sessionValue, ok := s.sessions.Load(sessionID)
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
+	}
+
+	session, ok := sessionValue.(*sseSession)
+	if !ok {
+		return fmt.Errorf("invalid session type for session ID: %s", sessionID)
+	}
+
+	// First, try to interpret the payload as a serializedRequest (cross-node HTTP
+	// request wrapper). This is compatible with the mcp-go implementation.
+	var serialized serializedRequest
+	if err := json.Unmarshal(payload, &serialized); err == nil &&
+		(serialized.URL != "" ||
+			serialized.Headers != nil ||
+			len(serialized.Body) != 0 ||
+			serialized.RemoteAddr != "" ||
+			serialized.Query != nil ||
+			serialized.Deadline != nil) {
+		return s.handleSerializedRequest(ctx, session, &serialized)
+	}
+
+	// Fallback: treat payload as a raw JSON-RPC message.
+	return s.handleRawRemoteMessage(ctx, session, payload)
+}
+
+// handleSerializedRequest processes a serializedRequest delivered via
+// SessionPubSub by extracting its JSON-RPC body and running it through the
+// standard JSON-RPC handlers.
+func (s *SSEServer) handleSerializedRequest(ctx context.Context, session *sseSession, req *serializedRequest) error {
+	// Respect remote deadline if provided.
+	if req.Deadline != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, *req.Deadline)
+		defer cancel()
+	}
+
+	// Optionally allow contextFunc to enrich context based on reconstructed
+	// http.Request semantics. The reconstructed request is not used for HTTP
+	// I/O, only for context decoration.
+	if s.contextFunc != nil {
+		httpReq, err := http.NewRequestWithContext(ctx, req.Method, req.URL, bytes.NewReader(req.Body))
+		if err == nil {
+			for key, values := range req.Headers {
+				for _, v := range values {
+					httpReq.Header.Add(key, v)
+				}
+			}
+			httpReq.RemoteAddr = req.RemoteAddr
+			ctx = s.contextFunc(ctx, httpReq)
+		}
+	}
+
+	return s.handleRawRemoteMessage(ctx, session, req.Body)
+}
+
+// handleRawRemoteMessage processes a raw JSON-RPC message for a given session
+// without going through the HTTP layer. It mirrors the logic in handleMessage
+// but skips HTTP-specific error handling and response writing.
+func (s *SSEServer) handleRawRemoteMessage(ctx context.Context, session *sseSession, body []byte) error {
+	// Parse message as raw JSON.
+	var rawMessage json.RawMessage
+	if err := json.Unmarshal(body, &rawMessage); err != nil {
+		if s.logger != nil {
+			s.logger.Errorf("Error parsing remote message: %v", err)
+		}
+		return fmt.Errorf("parse error: %w", err)
+	}
+
+	// Parse base message to determine type.
+	var base baseMessage
+	if err := json.Unmarshal(rawMessage, &base); err != nil {
+		if s.logger != nil {
+			s.logger.Errorf("Error parsing remote base message: %v", err)
+		}
+		return fmt.Errorf("parse error: %w", err)
+	}
+
+	// Create context with session.
+	ctx = s.createSessionContext(ctx, session)
+
+	// Handle different message types based on presence of ID and Method.
+	switch {
+	case base.ID != nil && base.Method != "":
+		s.handleRequestMessage(ctx, rawMessage, session)
+	case base.ID == nil && base.Method != "":
+		s.handleNotificationMessage(ctx, rawMessage, session)
+	case base.ID != nil && base.Method == "":
+		s.handleResponseMessage(ctx, rawMessage, session)
+	default:
+		if s.logger != nil {
+			s.logger.Errorf("Invalid JSON-RPC remote message: missing required fields")
+		}
+		return fmt.Errorf("invalid JSON-RPC message format")
+	}
+	return nil
+}
+
 // processRequestAsync processes the request asynchronously.
 func (s *SSEServer) processRequestAsync(ctx context.Context, request *JSONRPCRequest, session *sseSession) {
 	// Create a context that will not be canceled due to HTTP connection closure.
-	detachedCtx := context.WithoutCancel(ctx)
+	detachedCtx := icontext.WithoutCancel(ctx)
 
 	// Check if this is a response to our roots/list request.
 	if s.isRootsListResponse(request) {
@@ -736,6 +1122,24 @@ func (s *SSEServer) processRequestAsync(ctx context.Context, request *JSONRPCReq
 
 	if err != nil {
 		s.handleRequestError(err, request.ID, session)
+		return
+	}
+
+	// Check if result is already a JSON-RPC error.
+	if errorResp, ok := result.(*JSONRPCError); ok {
+		// Send error response directly through SSE.
+		fullResponseData, err := json.Marshal(errorResp)
+		if err != nil {
+			s.logger.Errorf("Error encoding error response: %v", err)
+			return
+		}
+		event := formatSSEEvent("message", fullResponseData)
+		select {
+		case session.eventQueue <- event:
+			// Successfully queued
+		default:
+			s.logger.Errorf("Failed to queue error response: event queue full for session %s", session.sessionID)
+		}
 		return
 	}
 
@@ -970,7 +1374,7 @@ func (s *SSEServer) sendNotificationToSession(sessionID string, notification *JS
 	// Get session
 	sessionValue, ok := s.sessions.Load(sessionID)
 	if !ok {
-		return fmt.Errorf("session not found: %s", sessionID)
+		return fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 
 	session, ok := sessionValue.(*sseSession)
@@ -1035,11 +1439,6 @@ func (s *SSEServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "Path not found: %s (expected endpoints: %s)", r.URL.Path, expectedEndpoints)
 }
 
-// generateSessionID generates a unique session ID.
-func generateSessionID() string {
-	return fmt.Sprintf("sse-%d-%d", time.Now().UnixNano(), time.Now().Unix())
-}
-
 // RegisterTool registers a tool with its handler.
 func (s *SSEServer) RegisterTool(tool *Tool, handler toolHandler) {
 	if tool == nil || handler == nil {
@@ -1047,6 +1446,34 @@ func (s *SSEServer) RegisterTool(tool *Tool, handler toolHandler) {
 		return
 	}
 	s.toolManager.registerTool(tool, handler)
+}
+
+// GetTool retrieves a registered tool by name.
+// Returns the tool and true if found, otherwise returns zero value and false.
+// The returned tool is a copy to prevent accidental modification.
+func (s *SSEServer) GetTool(name string) (Tool, bool) {
+	if name == "" {
+		return Tool{}, false
+	}
+
+	tool, exists := s.toolManager.getTool(name)
+	if !exists {
+		return Tool{}, false
+	}
+	// Return a copy to prevent modification of the original
+	return *tool, true
+}
+
+// GetTools returns a copy of all registered tools.
+// The returned slice contains copies of the tools to prevent accidental modification.
+func (s *SSEServer) GetTools() []Tool {
+	toolPtrs := s.toolManager.getTools()
+
+	tools := make([]Tool, 0, len(toolPtrs))
+	for _, toolPtr := range toolPtrs {
+		tools = append(tools, *toolPtr) // getTools() guarantees non-nil
+	}
+	return tools
 }
 
 // UnregisterTools removes multiple tools by names and returns an error if no tools were unregistered.
@@ -1120,7 +1547,7 @@ func (s *SSEServer) ListRoots(ctx context.Context) (*ListRootsResult, error) {
 	// Check if session exists in our sessions map.
 	_, exists := s.sessions.Load(sessionID)
 	if !exists {
-		return nil, fmt.Errorf("session not found: %s", sessionID)
+		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 
 	// Create standard JSON-RPC request.
@@ -1153,7 +1580,7 @@ func (s *SSEServer) SendRequest(ctx context.Context, sessionID string, request *
 	// Get session
 	sessionValue, ok := s.sessions.Load(sessionID)
 	if !ok {
-		return nil, fmt.Errorf("session not found: %s", sessionID)
+		return nil, fmt.Errorf("%w: %s", ErrSessionNotFound, sessionID)
 	}
 
 	session, ok := sessionValue.(*sseSession)
@@ -1264,4 +1691,29 @@ func (s *SSEServer) UnregisterNotificationHandler(method string) {
 	if s.logger != nil {
 		s.logger.Debugf("Unregistered notification handler for method: %s", method)
 	}
+}
+
+// BasePath returns the base path of the SSE server.
+func (s *SSEServer) BasePath() string {
+	return s.basePath
+}
+
+// SSEEndpoint returns the SSE endpoint path.
+func (s *SSEServer) SSEEndpoint() string {
+	return s.sseEndpoint
+}
+
+// MessageEndpoint returns the message endpoint path.
+func (s *SSEServer) MessageEndpoint() string {
+	return s.messageEndpoint
+}
+
+// SSEPath returns the full SSE path (basePath + sseEndpoint).
+func (s *SSEServer) SSEPath() string {
+	return s.basePath + s.sseEndpoint
+}
+
+// MessagePath returns the full message path (basePath + messageEndpoint).
+func (s *SSEServer) MessagePath() string {
+	return s.basePath + s.messageEndpoint
 }

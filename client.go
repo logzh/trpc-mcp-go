@@ -106,6 +106,11 @@ type TransportAware interface {
 	GetTransportInfo() TransportInfo
 }
 
+// HTTPBeforeRequestFunc is called before sending each HTTP request.
+// It can inspect and modify the request (e.g., add headers, modify URL).
+// Returning an error will abort the request.
+type HTTPBeforeRequestFunc func(ctx context.Context, req *http.Request) error
+
 // Client represents an MCP client.
 type Client struct {
 	transport        httpTransport          // transport layer.
@@ -128,6 +133,9 @@ type Client struct {
 	// Roots support.
 	rootsProvider RootsProvider // Provider for roots information.
 	rootsMu       sync.RWMutex  // Mutex for protecting the rootsProvider.
+
+	// HTTP before-request function.
+	httpBeforeRequestFunc HTTPBeforeRequestFunc
 }
 
 // ClientOption client option function
@@ -239,6 +247,7 @@ func WithProtocolVersion(version string) ClientOption {
 func WithClientLogger(logger Logger) ClientOption {
 	return func(c *Client) {
 		c.logger = logger
+		c.transportConfig.logger = logger
 		c.transportOptions = append(c.transportOptions, withClientTransportLogger(logger))
 	}
 }
@@ -253,6 +262,7 @@ func WithClientGetSSEEnabled(enabled bool) ClientOption {
 // WithClientPath sets a custom path for the client transport.
 func WithClientPath(path string) ClientOption {
 	return func(c *Client) {
+		c.transportConfig.path = path
 		c.transportOptions = append(c.transportOptions, withClientTransportPath(path))
 	}
 }
@@ -288,6 +298,7 @@ func WithHTTPHeaders(headers http.Header) ClientOption {
 // This is typically only needed when using custom implementations of HTTPReqHandler.
 func WithServiceName(serviceName string) ClientOption {
 	return func(c *Client) {
+		c.transportConfig.serviceName = serviceName
 		c.transportOptions = append(c.transportOptions, withTransportServiceName(serviceName))
 	}
 }
@@ -297,10 +308,27 @@ func WithServiceName(serviceName string) ClientOption {
 // that support additional configuration options.
 func WithHTTPReqHandlerOption(options ...HTTPReqHandlerOption) ClientOption {
 	return func(c *Client) {
+		c.transportConfig.httpReqHandlerOptions = append(c.transportConfig.httpReqHandlerOptions, options...)
 		for _, option := range options {
 			c.transportOptions = append(c.transportOptions, withTransportHTTPReqHandlerOption(option))
 		}
 	}
+}
+
+// WithHTTPBeforeRequest sets a function to be called before each HTTP request.
+func WithHTTPBeforeRequest(fn HTTPBeforeRequestFunc) ClientOption {
+	return func(c *Client) {
+		c.httpBeforeRequestFunc = fn
+	}
+}
+
+// applyHTTPBeforeRequest calls the HTTP before-request function if set.
+// If the function returns an error, the error is returned.
+func (c *Client) applyHTTPBeforeRequest(ctx context.Context, req *http.Request) error {
+	if c.httpBeforeRequestFunc != nil {
+		return c.httpBeforeRequestFunc(ctx, req)
+	}
+	return nil
 }
 
 // GetState returns the current client state.
@@ -373,8 +401,9 @@ func (c *Client) Initialize(ctx context.Context, initReq *InitializeRequest) (*I
 
 	// Try to establish GET SSE connection if transport supports it
 	if t, ok := c.transport.(*streamableHTTPClientTransport); ok {
-		// Start GET SSE connection asynchronously to avoid blocking
-		go t.establishGetSSEConnection()
+		// Start GET SSE connection asynchronously to avoid blocking.
+		// Pass the context so GET SSE can inherit context values.
+		go t.establishGetSSEConnection(ctx)
 	}
 
 	return initResult, nil
